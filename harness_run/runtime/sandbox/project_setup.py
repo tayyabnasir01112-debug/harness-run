@@ -19,7 +19,9 @@ What it manages (the README section explains the *why* of each piece):
   public-access prevention; the record lifecycle rules on it);
 * the Artifact Registry Docker repo the sandbox images are pushed to, and the read grant
   on it for the **Agent Sandbox service agent** (``service-<number>@gcp-sa-vertex-sandbox``),
-  which pulls the image when a sandbox starts;
+  which pulls the image when a sandbox starts — provisioning that service agent first on a
+  project that has never used Agent Sandbox (Google otherwise creates it lazily, and the
+  grant cannot name an account that does not exist yet);
 * the operator service account (the identity that deploys and drives turns — the whole
   control plane), its project role, and **bucket- and repo-scoped** storage/registry
   grants (least privilege for shared projects);
@@ -91,6 +93,10 @@ OPERATOR_BUCKET_ROLE = "roles/storage.admin"
 OPERATOR_REPO_ROLE = "roles/artifactregistry.writer"
 # The Agent Sandbox service agent pulls the image when a sandbox starts.
 SANDBOX_AGENT_REPO_ROLE = "roles/artifactregistry.reader"
+# The service whose Service Usage identity provisions that service agent. Google creates it
+# lazily (on the project's first use of Agent Sandbox), so on a fresh project it does not
+# exist until asked for — ``generateServiceIdentity`` on this service is the ask.
+SANDBOX_AGENT_SERVICE = "aiplatform.googleapis.com"
 
 # The model identity: the account whose access tokens the client mints per turn and hands
 # to the sandbox for Vertex model calls. It holds only what a model call needs — the agent's
@@ -123,6 +129,11 @@ def sandbox_agent_email(project_number: str | int) -> str:
     read access to the image repo — the one grant the platform side needs from us.
     """
     return f"service-{project_number}@gcp-sa-vertex-sandbox.iam.gserviceaccount.com"
+
+
+def provision_sandbox_agent_command(project: str) -> str:
+    """The gcloud equivalent of what the tool does to make the service agent exist."""
+    return f"gcloud beta services identity create --service={SANDBOX_AGENT_SERVICE} --project={project}"
 
 
 def predict_role_name(project: str) -> str:
@@ -263,7 +274,7 @@ class GcpApi:
             raise GcpError(f"HTTP {r.status_code}: {msg}", status=r.status_code)
         return r.json() if r.text else {}
 
-    def _wait_operation(self, base: str, op: dict, timeout: float = 600.0) -> None:
+    def _wait_operation(self, base: str, op: dict, timeout: float = 600.0) -> dict:
         deadline = time.monotonic() + timeout
         while not op.get("done"):
             if time.monotonic() > deadline:
@@ -272,6 +283,7 @@ class GcpApi:
             op = self.request("GET", f"{base}/{op['name']}") or {}
         if op.get("error"):
             raise GcpError(f"operation failed: {op['error']}")
+        return op
 
     # -- Service Usage ----------------------------------------------------------
 
@@ -307,6 +319,25 @@ class GcpApi:
             json_body={"serviceIds": list(services)},
         )
         self._wait_operation("https://serviceusage.googleapis.com/v1", op or {})
+
+    def generate_service_identity(self, service: str) -> str | None:
+        """Provision the Google-managed service agent(s) of ``service`` for this project.
+
+        What ``gcloud beta services identity create --service=<service>`` does. Additive and
+        idempotent: Google would create the same identities itself on the project's first
+        use of the service; this only makes that happen now. Returns the email of the
+        service's primary agent as the API reports it (``None`` when it reports none). The
+        API names only that primary agent (``gcp-sa-aiplatform`` for Vertex); the others it
+        provisions alongside, such as ``gcp-sa-vertex-sandbox``, go unlisted — so callers
+        verify those by using them, not by this value.
+        """
+        op = self.request(
+            "POST",
+            f"https://serviceusage.googleapis.com/v1beta1/projects/{self.project}/services/{service}"
+            ":generateServiceIdentity",
+        )
+        done = self._wait_operation("https://serviceusage.googleapis.com/v1beta1", op or {})
+        return (done.get("response") or {}).get("email")
 
     # -- project IAM (Cloud Resource Manager) ------------------------------------
 
@@ -619,6 +650,26 @@ def _grant(
             raise
 
 
+def _grant_sandbox_agent(api: GcpApi, cfg: Settings, addition: tuple[str, str]) -> None:
+    """Grant the Agent Sandbox service agent its repo read, riding out the propagation
+    window of a just-provisioned agent; if it still does not exist, say what to run."""
+    try:
+        _grant(
+            lambda: api.get_repository_policy(cfg.location, cfg.repo_id),
+            lambda p_: api.set_repository_policy(cfg.location, cfg.repo_id, p_),
+            [addition],
+            retry_missing_s=120,
+        )
+    except GcpError as e:
+        if not _member_missing(e):
+            raise
+        raise GcpError(
+            f"{e}\nThe Agent Sandbox service agent still does not exist in this project. "
+            "Provision it, then re-run:\n  " + provision_sandbox_agent_command(cfg.project),
+            status=e.status,
+        ) from e
+
+
 def _model_items(api: GcpApi, cfg: Settings, enabled: set[str]) -> list[Item]:
     """The Claude-on-Vertex rows: a 1-output-token live probe per model (check only —
     accepting the Anthropic terms in Model Garden is a console action this tool cannot
@@ -746,8 +797,9 @@ def audit(api: GcpApi, cfg: Settings) -> list[Item]:
         else:
             items.append(Item("output lifecycle", OK, "record reaper rules present"))
 
-    # 4. The image repo, and the sandbox service agent's read on it.
+    # 4. The image repo, the Agent Sandbox service agent, and its read on the repo.
     repo = api.get_repository(cfg.location, cfg.repo_id)
+    agent_email = sandbox_agent_email(number)
     if repo is None:
         items.append(
             Item(
@@ -759,31 +811,54 @@ def audit(api: GcpApi, cfg: Settings) -> list[Item]:
         )
         items.append(
             Item(
+                "sandbox service agent", BLOCKED,
+                "provisioned right before its repo grant, once the repo exists",
+                key="sandbox agent",
+            )
+        )
+        items.append(
+            Item(
                 "sandbox agent reads images", BLOCKED,
                 "granted right after the repo exists",
             )
         )
     else:
         items.append(Item("image repo", OK, f"{cfg.image_repo()} exists"))
-        agent_member = f"serviceAccount:{sandbox_agent_email(number)}"
-        addition = (SANDBOX_AGENT_REPO_ROLE, agent_member)
+        addition = (SANDBOX_AGENT_REPO_ROLE, f"serviceAccount:{agent_email}")
         if missing_bindings(api.get_repository_policy(cfg.location, cfg.repo_id), [addition]):
+            # Google creates the service agent lazily, on the project's first use of Agent
+            # Sandbox, so on a fresh project the grant is refused ("Service account ... does
+            # not exist") — however long it is retried. Whether the agent exists cannot be
+            # read; provisioning it is idempotent, so it is (re)asked for whenever the
+            # grant is missing, right before the grant (fixes apply in report order).
+            items.append(
+                Item(
+                    "sandbox service agent",
+                    FIX,
+                    f"provision {agent_email} (Google creates it lazily on first use; the "
+                    f"grant below cannot name it before it exists) — generateServiceIdentity "
+                    f"for {SANDBOX_AGENT_SERVICE}",
+                    fix=lambda: api.generate_service_identity(SANDBOX_AGENT_SERVICE),
+                    key="sandbox agent",
+                )
+            )
             items.append(
                 Item(
                     "sandbox agent reads images",
                     FIX,
-                    f"grant {SANDBOX_AGENT_REPO_ROLE} on the repo to {sandbox_agent_email(number)} "
+                    f"grant {SANDBOX_AGENT_REPO_ROLE} on the repo to {agent_email} "
                     "(it pulls the image when a sandbox starts)",
-                    # The service agent may not exist until the API has been used once:
-                    # retry the "member does not exist" window.
-                    fix=lambda a=addition: _grant(
-                        lambda: api.get_repository_policy(cfg.location, cfg.repo_id),
-                        lambda p_: api.set_repository_policy(cfg.location, cfg.repo_id, p_),
-                        [a], retry_missing_s=120,
-                    ),
+                    fix=lambda a=addition: _grant_sandbox_agent(api, cfg, a),
                 )
             )
         else:
+            items.append(
+                Item(
+                    "sandbox service agent", OK,
+                    f"{agent_email} exists (it holds the repo grant)",
+                    key="sandbox agent",
+                )
+            )
             items.append(
                 Item("sandbox agent reads images", OK, f"{SANDBOX_AGENT_REPO_ROLE} held by the service agent")
             )
@@ -1322,7 +1397,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("nothing changed.", flush=True)
                 return 2
         print(flush=True)
-        items = _apply_rounds(api, cfg, items)
+        try:
+            items = _apply_rounds(api, cfg, items)
+        except GcpError as e:
+            print(f"\napply failed: {e}", file=sys.stderr, flush=True)
+            return 1
 
     if args.verify:
         try:

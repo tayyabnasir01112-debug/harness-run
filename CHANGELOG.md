@@ -68,6 +68,19 @@ TestPyPI never accepts the same version twice, so a second rehearsal needs a ver
 
 [#6]: https://github.com/zytedata/harness-run/pull/6
 
+### Fixed
+
+- `harness-run-gcp-setup` sets up a project that has never used Agent Sandbox. Google creates
+  the Agent Sandbox service agent lazily, so on such a project the read grant on the image repo
+  failed with *Service account service-…@gcp-sa-vertex-sandbox… does not exist* once the retry
+  window ran out. The tool now provisions the service agent first (Service Usage
+  `generateServiceIdentity` for `aiplatform.googleapis.com`, what `gcloud beta services identity
+  create` does), reported as its own row, `sandbox service agent`, a FIX item in `--check` while
+  the grant is missing. Should the grant still fail, the error names the gcloud command to run,
+  and a failing fix now ends the run with its message instead of a traceback. ([#8])
+
+[#8]: https://github.com/zytedata/harness-run/pull/8
+
 ## 0.4.0 — 2026-09-23
 
 First public release.
