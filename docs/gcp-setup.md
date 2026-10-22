@@ -54,7 +54,12 @@ role with `aiplatform.endpoints.predict` (`harnessRunPredict`) — model calls a
 **Platform side**: the Google-managed **Agent Sandbox service agent**,
 `service-<PROJECT_NUMBER>@gcp-sa-vertex-sandbox.iam.gserviceaccount.com`, pulls the agent image when a
 sandbox starts and needs `roles/artifactregistry.reader` on the image repo. It gets nothing else; the
-sandbox it starts runs as a zero-permission tenant identity.
+sandbox it starts runs as a zero-permission tenant identity. Google creates this service agent lazily, on
+the project's first use of Agent Sandbox, so on a project that never used it the grant is refused with
+*Service account service-…@gcp-sa-vertex-sandbox… does not exist*. `harness-run-gcp-setup` provisions
+the agent before granting (Service Usage `generateServiceIdentity` for `aiplatform.googleapis.com`, the call
+behind `gcloud beta services identity create --service=aiplatform.googleapis.com --project <project>`, which
+is what to run when setting up by hand, or if the tool reports the grant still failing).
 
 **Prerequisites** (`harness-run-gcp-setup` creates them; `deploy` ensures the lifecycle rules):
 
@@ -113,6 +118,8 @@ gcloud storage buckets add-iam-policy-binding $OUT --member "serviceAccount:$OP"
 gcloud artifacts repositories create harness-run --repository-format=docker --location=$REGION --project $PROJECT
 gcloud artifacts repositories add-iam-policy-binding harness-run --location=$REGION --project $PROJECT \
   --member "serviceAccount:$OP" --role roles/artifactregistry.writer
+## the Agent Sandbox service agent exists only once provisioned (or after the project's first sandbox)
+gcloud beta services identity create --service=aiplatform.googleapis.com --project $PROJECT
 gcloud artifacts repositories add-iam-policy-binding harness-run --location=$REGION --project $PROJECT \
   --member "serviceAccount:service-$NUMBER@gcp-sa-vertex-sandbox.iam.gserviceaccount.com" \
   --role roles/artifactregistry.reader
