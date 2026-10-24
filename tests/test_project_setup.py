@@ -129,9 +129,12 @@ BUCKET = f"{PROJECT}-agent-output"
 class FakeGcp:
     """In-memory project state implementing the GcpApi surface audit/apply use."""
 
-    def __init__(self, *, enabled=None, model_ok=True, disabled_models=()):
+    def __init__(self, *, enabled=None, model_ok=True, disabled_models=(), sandbox_agent_exists=True):
         self.project = PROJECT
         self.enabled = set(enabled if enabled is not None else ps.REQUIRED_SERVICES)
+        # Google creates the Agent Sandbox service agent lazily: a project that never used
+        # Agent Sandbox has none, and IAM refuses to grant to it until it exists.
+        self.sandbox_agent_exists = sandbox_agent_exists
         self.disabled_models = set(disabled_models)
         self.buckets: dict[str, dict] = {}
         self.bucket_policies: dict[str, dict] = {}
@@ -150,6 +153,13 @@ class FakeGcp:
     def enable_services(self, services):
         self.calls.append(f"enable:{','.join(services)}")
         self.enabled.update(services)
+
+    def generate_service_identity(self, service):
+        self.calls.append(f"service-identity:{service}")
+        if service == "aiplatform.googleapis.com":
+            self.sandbox_agent_exists = True
+        # The API reports only the service's primary agent, not the sandbox one.
+        return f"service-{NUMBER}@gcp-sa-aiplatform.iam.gserviceaccount.com"
 
     def get_project_policy(self):
         return copy.deepcopy(self.project_policy)
@@ -219,6 +229,9 @@ class FakeGcp:
         return copy.deepcopy(self.repo_policies[(location, repo_id)])
 
     def set_repository_policy(self, location, repo_id, policy):
+        if not self.sandbox_agent_exists and any(AGENT in b["members"] for b in policy["bindings"]):
+            raise ps.GcpError(f"HTTP 400: Service account {AGENT.split(':', 1)[1]} does not exist.", status=400)
+        self.calls.append(f"set-repo-policy:{location}/{repo_id}")
         self.repo_policies[(location, repo_id)] = policy
 
     def model_ping(self, model, location="global"):
@@ -232,6 +245,19 @@ class FakeGcp:
 
 def _by_key(items):
     return {i.key: i for i in items}
+
+
+class FakeClock:
+    """Stands in for the ``time`` module: sleeping advances the clock instead of waiting."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
 
 
 # ---------------------------------------------------------------------------------
@@ -307,8 +333,8 @@ def test_apply_rounds_converge_on_an_empty_project():
     cfg = ps.Settings(project=PROJECT)
     items = ps._apply_rounds(api, cfg, ps.audit(api, cfg))
     by = _by_key(items)
-    for key in ("APIs", f"bucket:{BUCKET}", "output lifecycle", "image repo", "sandbox agent reads images",
-                "model SA", "model role", "model roles", "operator SA", "operator roles",
+    for key in ("APIs", f"bucket:{BUCKET}", "output lifecycle", "image repo", "sandbox agent",
+                "sandbox agent reads images", "model SA", "model role", "model roles", "operator SA", "operator roles",
                 f"operator-bucket:{BUCKET}", "operator pushes images", "impersonation", "model tokens"):
         assert by[key].status == ps.OK, (key, by[key].detail)
     for model in (*ps.DEFAULT_CHECK_MODELS, *ps.DEFAULT_OPTIONAL_MODELS):
@@ -336,6 +362,105 @@ def test_apply_rounds_converge_on_an_empty_project():
     assert all(b["role"] == ps.TOKEN_CREATOR_ROLE for b in model_sa_policy["bindings"])
     op_sa_policy = api.sa_policies[OPERATOR.split(":", 1)[1]]
     assert op_sa_policy["bindings"] == [{"role": ps.TOKEN_CREATOR_ROLE, "members": ["user:dev@example.com"]}]
+
+
+def test_fresh_project_provisions_the_sandbox_agent_before_granting_it(monkeypatch):
+    """Field report (2026-10-20, a fresh project that had never used Agent Sandbox):
+    the repo grant to the Agent Sandbox service agent failed with "Service account ... does
+    not exist" after the whole retry window, because Google creates that agent lazily and
+    nothing in the setup made it exist. Now the setup provisions it first."""
+    monkeypatch.setattr(ps, "time", FakeClock())
+    api = FakeGcp(enabled={"serviceusage.googleapis.com"}, sandbox_agent_exists=False)
+    cfg = ps.Settings(project=PROJECT)
+    items = ps._apply_rounds(api, cfg, ps.audit(api, cfg))
+    by = _by_key(items)
+    assert by["sandbox agent"].status == ps.OK, by["sandbox agent"].detail
+    assert by["sandbox agent reads images"].status == ps.OK
+    assert ps.exit_code(items) == 0
+    # Provisioned exactly once, and before the grant that needs it.
+    identity_calls = [c for c in api.calls if c.startswith("service-identity:")]
+    assert identity_calls == ["service-identity:aiplatform.googleapis.com"]
+    assert api.calls.index(identity_calls[0]) < api.calls.index(f"set-repo-policy:{LOCATION}/{ps.DEFAULT_REPO_ID}")
+
+
+def test_check_reports_the_sandbox_agent_as_a_fix_when_its_grant_is_missing():
+    api = FakeGcp(sandbox_agent_exists=False)
+    cfg = ps.Settings(project=PROJECT)
+    assert _by_key(ps.audit(api, cfg))["sandbox agent"].status == ps.BLOCKED  # no repo to grant on yet
+
+    api.create_repository(LOCATION, ps.DEFAULT_REPO_ID)
+    api.calls.clear()
+    by = _by_key(ps.audit(api, cfg))
+    assert by["sandbox agent"].status == ps.FIX
+    assert "generateServiceIdentity" in by["sandbox agent"].detail
+    assert AGENT.split(":", 1)[1] in by["sandbox agent"].detail
+    assert by["sandbox agent reads images"].status == ps.FIX
+    assert not api.calls  # an audit changes nothing — provisioning happens on apply only
+
+    # Once the grant is held, the agent evidently exists: OK without any call.
+    ps.add_bindings(api.repo_policies[(LOCATION, ps.DEFAULT_REPO_ID)], [(ps.SANDBOX_AGENT_REPO_ROLE, AGENT)])
+    by = _by_key(ps.audit(api, cfg))
+    assert by["sandbox agent"].status == ps.OK
+    assert by["sandbox agent reads images"].status == ps.OK
+    assert not api.calls
+
+
+def test_sandbox_agent_grant_still_failing_names_the_gcloud_command(monkeypatch):
+    """If provisioning did not make the agent exist (the API call is a best effort the docs
+    don't pin down), the error after the retry window says what to run by hand."""
+    monkeypatch.setattr(ps, "time", FakeClock())
+    api = FakeGcp(sandbox_agent_exists=False)
+    api.generate_service_identity = lambda service: api.calls.append(f"service-identity:{service}")
+    api.create_repository(LOCATION, ps.DEFAULT_REPO_ID)
+    cfg = ps.Settings(project=PROJECT)
+    with pytest.raises(ps.GcpError) as info:
+        ps._apply_rounds(api, cfg, ps.audit(api, cfg))
+    message = str(info.value)
+    assert "does not exist" in message
+    assert f"gcloud beta services identity create --service=aiplatform.googleapis.com --project={PROJECT}" in message
+    assert ps.time.now >= 120  # the propagation window was waited out first
+
+
+def test_cli_apply_failure_is_reported_not_raised(monkeypatch, capsys):
+    monkeypatch.setattr(ps, "time", FakeClock())
+    api = FakeGcp(sandbox_agent_exists=False)
+    api.generate_service_identity = lambda service: None
+    monkeypatch.setattr(ps, "GcpApi", lambda project: api)
+    assert ps.main(["--project", PROJECT, "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "apply failed:" in err and "gcloud beta services identity create" in err
+
+
+def test_generate_service_identity_posts_to_service_usage_and_waits_for_the_operation(monkeypatch):
+    monkeypatch.setattr(ps, "time", FakeClock())
+
+    class Resp:
+        def __init__(self, body):
+            self.body, self.status_code, self.ok, self.text = body, 200, True, "x"
+
+        def json(self):
+            return self.body
+
+    class Session:
+        def __init__(self):
+            self.requests = []
+
+        def request(self, method, url, json=None):
+            self.requests.append((method, url, json))
+            if method == "POST":
+                return Resp({"name": "operations/op1", "done": False})
+            return Resp({"name": "operations/op1", "done": True,
+                         "response": {"email": "service-1@gcp-sa-aiplatform.iam.gserviceaccount.com"}})
+
+    api = ps.GcpApi("p")
+    api._session = Session()
+    assert api.generate_service_identity("aiplatform.googleapis.com") == (
+        "service-1@gcp-sa-aiplatform.iam.gserviceaccount.com")
+    assert api._session.requests == [
+        ("POST", "https://serviceusage.googleapis.com/v1beta1/projects/p/services/aiplatform.googleapis.com"
+                 ":generateServiceIdentity", None),
+        ("GET", "https://serviceusage.googleapis.com/v1beta1/operations/op1", None),
+    ]
 
 
 def test_existing_custom_role_is_extended_additively():
